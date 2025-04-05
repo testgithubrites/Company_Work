@@ -1,0 +1,38 @@
+{
+  "zmq": {
+      "publisher": {
+          "address": "tcp://192.168.29.122:9907"
+      },
+      "subscriber": {
+          "address": "tcp://192.168.1.32:5555"
+      }
+  },
+  "detection": {
+      "intrusion_classes": [0,26,28,39,56,63,72,73],  
+      "crowd_threshold":2,
+      "loitering_threshold":4,
+      "fall_threshold":1,
+      "max_cameras": 10
+  },
+  "events": {
+      "object_abandoned": {
+          "event_type": "Object_Abandon_detected",
+          "detection": "True"
+      },
+      "loitering": {
+          "event_type": "loitering_detected",
+          "detection": "True"
+      },
+      "crowd_alert": {
+          "event_type": "Crowd_detected",
+          "detection": "True"
+      },"intrusion":{
+          "event_type": "intrusion_detected",
+          "detection": "True"
+      },
+        "fall":{
+          "event_type": "fall_detected",
+          "detection": "true"
+        }
+  }
+}
