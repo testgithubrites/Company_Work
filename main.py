@@ -53,9 +53,6 @@ with open('classes_yolo.json' , 'r') as class_file:
       
 config = load_config() #Store in a variable
 
-#Initialize tracker
-person_tracker = Tracker()
-
 #Initialize ZMQ context(containers for all sockets)
 context = zmq.Context()
 #Choose socket from Context
@@ -69,6 +66,10 @@ model = YOLO('yolov8s.pt') #Detection Model
 model.to(device)
 fall_model = YOLO('fall.pt') #Fall Model
 fall_model.to(device)
+abandonedmodel = YOLO('./abandanSmodel.pt')
+abandonedmodel.to(device)
+vegetation_model = YOLO('vegetation.pt')
+vegetation_model.to(device)
 
 lock = threading.Lock() #Apply lock to avoid deadlocks
 json_lock = threading.Lock()
@@ -84,6 +85,8 @@ pipelines = {} #Dictionary to save pipelines based on id for flushing in case of
 stream_flags = {} #Marks the stream as active , keeps track of whether stream is running.
 streams_thread= {} #Keeps track of all threads
 entry_time = {}
+abandoned_frame_counter = {}
+movement_history = {}
 
 #Load data from json file
 def load_streams_from_json(file_path):
@@ -123,6 +126,7 @@ def start_stream(rtsp_id,rtsp_url,analytics_dict,metadata,executor):
         streams_thread[rtsp_id] = stream_thread
     except Exception as e:
         print(f"Failed to start Stream {rtsp_id}: {e}")
+        print('Retrying')
         
 def stop_stream(rtsp_id):
     #Stop the thread for specific rtsp_id if running
@@ -253,6 +257,46 @@ def save_frame_and_send_fall_alert(rtsp_id,frame):
         queue_time = time.time()
         alert_queue.put((queue_time , payload))
         
+def save_frame_and_send_abandon_alert(rtsp_id,frame):
+        folder_path=f"./Abandon/{datetime.now().strftime('%Y-%m-%d')}"
+        os.makedirs(folder_path,exist_ok=True)
+        filename = os.path.join(folder_path, f'{rtsp_id}_{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}.jpg')
+        cv2.imwrite(filename, frame)
+        _ , buffer = cv2.imencode('.jpg',frame)
+        img_base64 = base64.b64encode(buffer).decode('utf-8')
+        event_config = config['events']['object_abandoned']
+        payload = {
+            "ID":rtsp_id,
+            "FrameData":img_base64,
+            "Event":event_config.get('event_type'),
+            "Timestamp": datetime.now().strftime('%Y-%m-%d_%H-%M-%S'),
+            "Detection":True
+        }
+        #Put payload in the queue
+        queue_time = time.time()
+        alert_queue.put((queue_time , payload))
+        
+def save_frame_and_send_vegetation_alert(rtsp_id,frame):
+        folder_path=f"./Vegetation/{datetime.now().strftime('%Y-%m-%d')}"
+        os.makedirs(folder_path,exist_ok=True)
+        filename = os.path.join(folder_path, f'{rtsp_id}_{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}.jpg')
+        cv2.imwrite(filename, frame)
+        _ , buffer = cv2.imencode('.jpg',frame)
+        img_base64 = base64.b64encode(buffer).decode('utf-8')
+        event_config = config['events']['vegetation']
+        payload = {
+            "ID":rtsp_id,
+            "FrameData":img_base64,
+            "Event":event_config.get('event_type'),
+            "Timestamp": datetime.now().strftime('%Y-%m-%d_%H-%M-%S'),
+            "Detection":True
+        }
+        #Put payload in the queue
+        queue_time = time.time()
+        alert_queue.put((queue_time , payload))
+        
+        
+        
 def process_stream(rtsp_id,rtsp_url,analytics_dict,stream_metadata):
     print(f"process_stream() started for Stream ID: {rtsp_id}",flush=True)
     
@@ -272,17 +316,22 @@ def process_stream(rtsp_id,rtsp_url,analytics_dict,stream_metadata):
         next((analytic["roi"] for analytic in analytics_dict if analytic["type"] == "fall"), []), dtype=np.int32
     ).reshape((-1, 1, 2))
     
+    abandon_roi = np.array(
+        next((analytic["roi"] for analytic in analytics_dict if analytic["type"] == "object_abandoned"), []), dtype=np.int32
+    ).reshape((-1, 1, 2))
+    
     last_save_intrusion_time = 0  #Track last save intrusion time
     last_save_loitering_time = 0 #Track last save loitering time
     crowd_last_save_time = 0 #Track last save crowd time
     fall_counter=0
     fall_save_time = 0
+    last_save_abandon_time = 0
     
     fps = stream_metadata['fps']
     # Define the GStreamer pipeline
     #rtph264depay ! h264parse ! avdec_h264 !
     gst_pipeline = (
-        f"filesrc location={rtsp_url} ! "
+        f"rtspsrc location={rtsp_url} ! "
         f"decodebin ! videoconvert ! videoscale ! videorate ! "
         f"video/x-raw, width=640, height=640, format=BGR, framerate={fps}/1 ! "
         f"appsink name=sink emit-signals=True"
@@ -328,10 +377,13 @@ def process_stream(rtsp_id,rtsp_url,analytics_dict,stream_metadata):
             
         
             frame = cv2.resize(frame,(640,640))
-            results = model(frame,classes=intrusion_classes,iou=0.25,conf=0.3,verbose=False)  #verbose produces cleaner outputs, suppress the logs
+            results = model(frame,classes=intrusion_classes,iou=0.3,conf=0.7,verbose=False)  #verbose produces cleaner outputs, suppress the logs
                   
             detected_objects = []  
             person_bboxes = []
+            #Initialize tracker
+            person_tracker = Tracker()
+            abandoned_tracker = Tracker()
             
             for result in results:
                 for box in result.boxes:
@@ -342,8 +394,8 @@ def process_stream(rtsp_id,rtsp_url,analytics_dict,stream_metadata):
                     if class_id == 0:
                         person_bboxes.append([x1,y1,x2,y2])
                 
-            #INTRUSION DETECTION
-            #Check detection is inside roi
+        #     #INTRUSION DETECTION
+        #     #Check detection is inside roi
             if "intrusion" in [analytic["type"] for analytic in analytics_dict]:
                 for obj in detected_objects:
                     x1, y1, x2, y2 = obj["bbox"]
@@ -367,14 +419,17 @@ def process_stream(rtsp_id,rtsp_url,analytics_dict,stream_metadata):
                 # Track time and alert for intrusion and loitering
                 current_time = time.time()
                 for obj in objects_bbs_ids:
-                    x1,y1,x2,y2,person_id = obj
-                    w = x2-x1
-                    h = y2-y1
-                    cx, cy = x1 + w // 2, y1 + h // 2  # Calculate center of bounding box
+                    x,y,w,h,person_id = obj
+                    cx, cy = x + w // 2, y + h // 2  # Calculate center of bounding box
+                    
+                    if person_id not in movement_history:
+                        movement_history[person_id] = [] #Initialise
+                    movement_history[person_id].append((cx,cy)) #Centers of bounding box
 
-                    cv2.rectangle(frame, (x1, y1), (w, h), (0, 255, 0), 2)  # Bounding box
+                    cv2.rectangle(frame, (x1, y1), (x + w, y + h), (0, 255, 0), 2)  # Bounding box
                     text = f"person ID: {person_id}"  # Display person ID
                     cv2.putText(frame, text, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    
                     if is_inside_roi((cx,cy),loitering_roi):
                      # Loitering alert for new entry into ROI
                         if person_id not in entry_time:
@@ -388,6 +443,12 @@ def process_stream(rtsp_id,rtsp_url,analytics_dict,stream_metadata):
                             current_time = time.time()
                             # Check if the last loitering alert was sent more than loitering_alert_interval ago
                             if current_time - last_save_loitering_time >= 5:
+                                movement = movement_history.get(person_id,[])
+                                if len(movement) >= 2 : #Lines will be drawn between two points
+                                    for i in range(1,len(movement)):
+                                        cv2.line(frame, movement[i - 1], movement[i], (0, 0, 255), 2)
+                                    for (x,y) in movement:
+                                        cv2.circle(frame,(x,y),radius=4,color=(255,255,0),thickness=1)
                                 save_frame_and_send_loitering_alert(rtsp_id, frame)
                                 last_save_loitering_time = current_time
                     else:
@@ -409,7 +470,7 @@ def process_stream(rtsp_id,rtsp_url,analytics_dict,stream_metadata):
                                 save_frame_and_send_crowd_alert(rtsp_id,frame),
                                 crowd_last_save_time = current_time
                                     
-        #FALL DETECTION
+          #FALL DETECTION
             if "fall" in [analytic["type"] for analytic in analytics_dict]:
                 fall_results = fall_model.predict(frame,iou=0.25,conf=0.5,verbose = False)
                 fall_detected = False #Flag to check fall is detected
@@ -440,7 +501,63 @@ def process_stream(rtsp_id,rtsp_url,analytics_dict,stream_metadata):
                             else:
                                 #Reset frame counter if no fall is detected (fall detected in consecutive 2 frames , after that no fall is detected , so make counter as 0).
                                 fall_counter = 0
-                      
+            
+            #Abandoned object                
+            if "object_abandoned" in [analytic["type"] for analytic in analytics_dict]:
+                    abandon_results = abandonedmodel.predict(frame, conf=0.2, iou=0.25)
+                        # Append all detected bounding boxes (x , y , w, h)
+                    abandoned_bboxes = [
+                            [int(box.xyxy[0][0]), int(box.xyxy[0][1]), int(box.xyxy[0][2]) - int(box.xyxy[0][0]), int(box.xyxy[0][3]) - int(box.xyxy[0][1])]
+                            for box in abandon_results[0].boxes
+                        ]
+                     
+                    tracked_objects, _ = abandoned_tracker.update(abandoned_bboxes)
+                    for tracked_obj in tracked_objects:
+                        x, y, w, h, obj_id = tracked_obj
+                        point_check = (x + w // 2, y + h // 2)
+
+                        #Track for how long the objects stays (by checking on frames)
+                        if obj_id not in abandoned_frame_counter:
+                            abandoned_frame_counter[obj_id] = 1
+                        else:
+                            abandoned_frame_counter[obj_id] += 1
+                            
+                        if abandoned_frame_counter[obj_id] >= 10:
+                            if is_inside_roi(point_check,abandon_roi):
+                            #Check horizontal and vertical overlaps up,down,right,left (check for personbbox and objectbbox)
+                                is_intersecting_person = any(
+                                    (x < x2 and x + w > x1) and (y < y2 and y + h > y1)
+                                        for x1, y1, x2, y2 in person_bboxes
+                                    )
+                                if not is_intersecting_person:
+                                    current_time = time.time()
+                                    if current_time - last_save_abandon_time >=5 :
+                                        # Highlight the abandoned object
+                                            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 0, 255), 2)
+                                            text = "Abandoned Object"
+                                            (text_w, text_h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                                            cv2.rectangle(frame, (x, y - text_h - 10), (x + text_w, y), (0, 0, 0), -1)
+                                            cv2.putText(frame, text, (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                                            save_frame_and_send_abandon_alert(rtsp_id,frame)
+                                            last_save_abandon_time = current_time
+            
+            #Vegetation model
+            if "vegetation" in [analytic["type"] for analytic in analytics_dict]:
+                vegetation_results = vegetation_model.predict(frame,iou=0.25,conf=0.5)   
+                for result in vegetation_results:
+                    for box in result.boxes:
+                        x1, y1, x2, y2 = map(int, box.xyxy[0])
+                        conf = float(box.conf[0])
+                        cls = int(box.cls[0])
+                        class_name = vegetation_model.names[cls]
+
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
+                        cv2.putText(frame, f"{class_name} {conf:.2f}", (x1, y1 - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
+                        save_frame_and_send_vegetation_alert(rtsp_id,frame)
+                            
+                
+                    
             #cv2.polylines(frame, [loitering_roi], isClosed=True, color=(0,0,255), thickness=2)
             #cv2.polylines(frame, [crowd_roi], isClosed=True, color=(0,255,255), thickness=2)
             #cv2.polylines(frame, [intrusion_roi], isClosed=True, color=(0,255,255), thickness=2)
