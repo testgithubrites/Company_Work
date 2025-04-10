@@ -439,6 +439,7 @@ def process_stream(rtsp_id,rtsp_url,analytics_dict,stream_metadata):
                     detected_objects.append({"bbox":[x1,y1,x2,y2] , "class_id":class_id , "class_name":class_name})
                     if class_id == 0:
                         person_bboxes.append([x1,y1,x2,y2])
+                        
                 
         #     #INTRUSION DETECTION
         #     #Check detection is inside roi
@@ -461,15 +462,18 @@ def process_stream(rtsp_id,rtsp_url,analytics_dict,stream_metadata):
             #         save_frame_and_send_intrusion_alert(rtsp_id,frame)
             #         last_save_intrusion_time = current_time
                             
-        #     #Loitering Detection  
+        ##Loitering Detection  
             if "loitering" in [analytic["type"] for analytic in analytics_dict]:
                 # Assign IDs using person_tracker
+                # print(person_bboxes)
                 objects_bbs_ids, _ = person_tracker.update(person_bboxes)
                 # Track time and alert for intrusion and loitering
+                # print(objects_bbs_ids)
                 current_time = time.time()
                 for obj in objects_bbs_ids:
                     x,y,w,h,person_id = obj
-                    cx, cy = x+w // 2 , y+h // 2 # Calculate center of bounding box
+                    cx,cy = x+w//2 , y+h//2 # Calculate center of bounding box
+                    print(f".......{(cx,cy)}")
                     if person_id not in movement_history:
                         movement_history[person_id] = [] #Initialise
                     movement_history[person_id].append((cx,cy)) #Centers of bounding box    
@@ -491,18 +495,21 @@ def process_stream(rtsp_id,rtsp_url,analytics_dict,stream_metadata):
                             
                             # Check if the last loitering alert was sent more than loitering_alert_interval ago
                             if current_time - last_save_loitering_time >= 5:
-                                cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 255, 255), 2)
+                                
+                                cv2.rectangle(frame, (x, y), (x +w, y + h), (255, 255, 255), 2)
                                 movement = movement_history.get(person_id,[])
                                 if len(movement)>=2 : #Lines will be drawn between two points
                                     for i in range(1,len(movement)):
                                         pt1 = movement[i - 1]
                                         pt2 = movement[i]
                                         cv2.line(frame, pt1, pt2, (0, 0, 255), 2)
+                                        print(pt1,pt2)
                                         
                                 for (mx,my) in movement:
                                     cv2.circle(frame,(mx,my),radius=4,color=(255,255,0),thickness=-1)
                                 save_frame_and_send_loitering_alert(rtsp_id, frame)
                                 last_save_loitering_time = current_time
+                                print(movement_history)
                     else:
                         # Remove tracking if person leaves ROI
                         if person_id in entry_time:
@@ -704,11 +711,12 @@ def zmq_listener(streams,analytics_dict,stream_metadata,executor):
     rep_socket = context.socket(zmq.REP)
     try:
         rep_socket.bind("tcp://*:5556")  
-        print('Starting listener thread')
+       
     except zmq.ZMQError as e:
         print(f"Failed to bind socket: {e}")
         return  # Exit if binding fails
     while True:
+        print('Starting listener thread')
         try:
             response = {"status" : "error" , "message" : "server error"}
             

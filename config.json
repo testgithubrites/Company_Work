@@ -10,7 +10,7 @@
   "detection": {
       "intrusion_classes": [0,26,28,39,56,63,72,73],  
       "crowd_threshold":2,
-      "loitering_threshold":2,
+      "loitering_threshold":4,
       "fall_threshold":3,
       "fire_threshold":2,
       "max_cameras": 10
